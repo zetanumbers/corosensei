@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CoroutineResult"],"fn":["on_stack"],"mod":["stack","trap"],"struct":["Coroutine","Fiber","Yielder"]};
