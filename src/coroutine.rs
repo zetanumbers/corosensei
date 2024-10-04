@@ -1,8 +1,7 @@
 use core::cell::Cell;
-use core::hint::unreachable_unchecked;
 use core::marker::PhantomData;
 use core::mem::{self, ManuallyDrop};
-use core::ptr;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::arch::{self, STACK_ALIGNMENT};
 #[cfg(feature = "default-stack")]
@@ -12,7 +11,8 @@ use crate::stack::StackTebFields;
 use crate::stack::{self, StackPointer};
 use crate::trap::CoroutineTrapHandler;
 use crate::unwind::{self, initial_func_abi, CaughtPanic, ForcedUnwindErr};
-use crate::util::{self, EncodedValue};
+use crate::util;
+use crate::Fiber;
 
 /// Value returned from resuming a coroutine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -42,6 +42,33 @@ impl<Yield, Return> CoroutineResult<Yield, Return> {
     }
 }
 
+enum OutputArg<Input, Yield, Return, Stack> {
+    Yield {
+        coroutine_exec: Fiber<InputArg<Input, Yield, Return, Stack>>,
+        yield_: Yield,
+        _input: PhantomData<fn(Input)>,
+        _stack: PhantomData<Stack>,
+    },
+    Return {
+        ret_val: Option<Return>,
+        stack: Stack,
+    },
+}
+
+struct UnwindArg<Stack> {
+    stack: Stack,
+}
+
+enum InputArg<Input, Yield, Return, Stack> {
+    Continue {
+        input: Input,
+        parent: Fiber<OutputArg<Input, Yield, Return, Stack>>,
+    },
+    Unwind {
+        parent: Fiber<UnwindArg<Stack>>,
+    },
+}
+
 /// A coroutine wraps a closure and allows suspending its execution more than
 /// once, returning a value each time.
 ///
@@ -64,40 +91,12 @@ impl<Yield, Return> CoroutineResult<Yield, Return> {
 /// are `Send` then it is safe to manually implement `Send` for a coroutine.
 #[cfg(feature = "default-stack")]
 pub struct Coroutine<Input, Yield, Return, Stack: stack::Stack = DefaultStack> {
-    // Stack that the coroutine is executing on.
-    stack: Stack,
+    inner: Option<CoroutineImpl<Input, Yield, Return, Stack>>,
+}
 
-    // Current stack pointer at which the coroutine state is held. This is
-    // None when the coroutine has completed execution.
-    stack_ptr: Option<StackPointer>,
-
-    // Initial stack pointer value. This is used to detect whether a coroutine
-    // has ever been resumed since it was created.
-    //
-    // This works because it is impossible for a coroutine to revert back to its
-    // initial stack pointer: suspending a coroutine requires pushing several
-    // values to the stack.
-    initial_stack_ptr: StackPointer,
-
-    // Function to call to drop the initial state of a coroutine if it has
-    // never been resumed.
-    drop_fn: unsafe fn(ptr: *mut u8),
-
-    // We want to be covariant over Yield and Return, and contravariant
-    // over Input.
-    //
-    // Effectively this means that we can pass a
-    //   Coroutine<&'a (), &'static (), &'static ()>
-    // to a function that expects a
-    //   Coroutine<&'static (), &'c (), &'d ()>
-    marker: PhantomData<fn(Input) -> CoroutineResult<Yield, Return>>,
-
-    // Coroutine must be !Send.
-    /// ```compile_fail
-    /// fn send<T: Send>() {}
-    /// send::<corosensei::Coroutine<(), ()>>();
-    /// ```
-    marker2: PhantomData<*mut ()>,
+enum CoroutineImpl<Input, Yield, Return, Stack> {
+    Running(Fiber<InputArg<Input, Yield, Return, Stack>>),
+    Finished(Stack),
 }
 
 /// A coroutine wraps a closure and allows suspending its execution more than
@@ -145,7 +144,7 @@ impl<Input, Yield, Return> Coroutine<Input, Yield, Return, DefaultStack> {
     /// `Yielder::suspend`.
     pub fn new<F>(f: F) -> Self
     where
-        F: FnOnce(&Yielder<Input, Yield>, Input) -> Return,
+        F: FnOnce(&Yielder<Input, Yield, Return, DefaultStack>, Input) -> Return,
         F: 'static,
     {
         Self::with_stack(Default::default(), f)
@@ -160,66 +159,24 @@ impl<Input, Yield, Return, Stack: stack::Stack> Coroutine<Input, Yield, Return, 
     /// [`Yielder::suspend`].
     pub fn with_stack<F>(stack: Stack, f: F) -> Self
     where
-        F: FnOnce(&Yielder<Input, Yield>, Input) -> Return,
+        F: FnOnce(&Yielder<Input, Yield, Return, Stack>, Input) -> Return,
         F: 'static,
     {
-        // The ABI of the initial function is either "C" or "C-unwind" depending
-        // on whether the "asm-unwind" feature is enabled.
-        initial_func_abi! {
-            unsafe fn coroutine_func<Input, Yield, Return, F>(
-                input: EncodedValue,
-                parent_link: &mut StackPointer,
-                func: *mut F,
-            ) -> !
-            where
-                F: FnOnce(&Yielder<Input, Yield>, Input) -> Return,
-            {
-                // The yielder is a #[repr(transparent)] wrapper around the
-                // parent link on the stack.
-                let yielder = &*(parent_link as *mut StackPointer as *const Yielder<Input, Yield>);
-
-                // Read the function from the stack.
-                debug_assert_eq!(func as usize % mem::align_of::<F>(), 0);
-                let f = func.read();
-
-                // This is the input from the first call to resume(). It is not
-                // possible for a forced unwind to reach this point because we
-                // check if a coroutine has been resumed at least once before
-                // generating a forced unwind.
-                let input : Result<Input, ForcedUnwindErr> = util::decode_val(input);
-                let input = match input {
-                    Ok(input) => input,
-                    Err(_) => unreachable_unchecked(),
-                };
-
-                // Run the body of the generator, catching any panics.
-                let result = unwind::catch_unwind_at_root(|| f(yielder, input));
-
-                // Return any caught panics to the parent context.
-                let mut result = ManuallyDrop::new(result);
-                arch::switch_and_reset(util::encode_val(&mut result), yielder.stack_ptr.as_ptr());
-            }
-        }
-
-        // Drop function to free the initial state of the coroutine.
-        unsafe fn drop_fn<T>(ptr: *mut u8) {
-            ptr::drop_in_place(ptr as *mut T);
-        }
-
-        unsafe {
-            // Set up the stack so that the coroutine starts executing
-            // coroutine_func. Write the given function object to the stack so
-            // its address is passed to coroutine_func on the first resume.
-            let stack_ptr = arch::init_stack(&stack, coroutine_func::<Input, Yield, Return, F>, f);
-
-            Self {
+        Coroutine {
+            inner: CoroutineImpl::Running(Fiber::with_stack(
+                |input| {
+                    match input {
+                        InputArg::Continue { input, parent } => {
+                            let yielder = Yielder { switch: Cell::new(Some(parent)) };
+                            let res = catch_unwind(AssertUnwindSafe(|| f(&yielder, input)));
+                            (yielder.switch.take().unwrap(), )
+                        },
+                        InputArg::Unwind { parent } => {},
+                    }
+                    todo!()
+                },
                 stack,
-                stack_ptr: Some(stack_ptr),
-                initial_stack_ptr: stack_ptr,
-                drop_fn: drop_fn::<F>,
-                marker: PhantomData,
-                marker2: PhantomData,
-            }
+            )),
         }
     }
 
@@ -416,20 +373,11 @@ impl<Input, Yield, Return, Stack: stack::Stack> Coroutine<Input, Yield, Return, 
     /// This allows the stack to be re-used for another coroutine.
     #[allow(unused_mut)]
     pub fn into_stack(mut self) -> Stack {
-        assert!(
-            self.done(),
-            "cannot extract stack from an incomplete coroutine"
-        );
-
-        #[cfg(windows)]
-        unsafe {
-            arch::update_stack_teb_fields(&mut self.stack);
-        }
-
-        unsafe {
-            let stack = ptr::read(&self.stack);
-            mem::forget(self);
-            stack
+        match self.inner {
+            CoroutineImpl::Running(_) => {
+                panic!("cannot extract stack from an incomplete coroutine")
+            }
+            CoroutineImpl::Finished(stack) => stack,
         }
     }
 
@@ -445,11 +393,7 @@ impl<Input, Yield, Return, Stack: stack::Stack> Coroutine<Input, Yield, Return, 
     /// care. See [`CoroutineTrapHandler::setup_trap_handler`] for the exact
     /// safety requirements.
     pub fn trap_handler(&self) -> CoroutineTrapHandler<Return> {
-        CoroutineTrapHandler {
-            stack_base: self.stack.base(),
-            stack_limit: self.stack.limit(),
-            marker: PhantomData,
-        }
+        todo!()
     }
 }
 
@@ -476,25 +420,21 @@ impl<Input, Yield, Return, Stack: stack::Stack> Drop for Coroutine<Input, Yield,
 /// Multiple references can be created to the same `Yielder`, but these cannot
 /// be moved to another thread.
 #[repr(transparent)]
-pub struct Yielder<Input, Yield> {
+pub struct Yielder<Input, Yield, Return, Stack> {
     // Internally the Yielder is just the parent link on the stack which is
     // updated every time resume() is called.
-    stack_ptr: Cell<StackPointer>,
-    marker: PhantomData<fn(Yield) -> Input>,
+    switch: Cell<Option<Fiber<OutputArg<Input, Yield, Return, Stack>>>>,
 }
 
-impl<Input, Yield> Yielder<Input, Yield> {
+impl<Input, Yield, Return, Stack> Yielder<Input, Yield, Return, Stack> {
     /// Suspends the execution of a currently running coroutine.
     ///
     /// This function will switch control back to the original caller of
     /// [`Coroutine::resume`]. This function will then return once the
     /// [`Coroutine::resume`] function is called again.
     pub fn suspend(&self, val: Yield) -> Input {
-        unsafe {
-            let mut val = ManuallyDrop::new(val);
-            let result = arch::switch_yield(util::encode_val(&mut val), self.stack_ptr.as_ptr());
-            unwind::maybe_force_unwind(util::decode_val(result))
-        }
+        // Does not allocate since the closure is ZST
+        self.switch.take().unwrap().(val)
     }
 
     /// Executes some code on the stack of the parent context (the one who
@@ -508,23 +448,15 @@ impl<Input, Yield> Yielder<Input, Yield> {
     ///
     /// Any panics in the provided closure are automatically propagated back up
     /// to the caller of this function.
-    pub fn on_parent_stack<F, R>(&self, f: F) -> R
+    pub fn on_parent_stack<F, R>(&self, _f: F) -> R
     where
-        F: FnOnce() -> R,
+        F: FnOnce() -> R + 'static,
         // The F: Send bound here is somewhat subtle but important. It exists to
         // prevent references to the Yielder from being passed into the parent
         // thread.
-        F: Send,
+        F: Send + 'static,
     {
-        // Get the top of the parent stack.
-        let stack_ptr = unsafe {
-            StackPointer::new_unchecked(self.stack_ptr.get().get() - arch::PARENT_LINK_OFFSET)
-        };
-
-        // Create a virtual stack that starts below the parent stack.
-        let stack = unsafe { ParentStack::new(stack_ptr) };
-
-        on_stack(stack, f)
+        self.switch.take().unwrap()
     }
 }
 

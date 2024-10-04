@@ -234,7 +234,6 @@
 //!
 //! Implies `unwind`.
 
-#![no_std]
 #![cfg_attr(feature = "asm-unwind", feature(asm_unwind, c_unwind))]
 #![warn(missing_docs)]
 
