@@ -167,11 +167,13 @@ impl<Input, Yield, Return, Stack: stack::Stack> Coroutine<Input, Yield, Return, 
                 |input| {
                     match input {
                         InputArg::Continue { input, parent } => {
-                            let yielder = Yielder { switch: Cell::new(Some(parent)) };
+                            let yielder = Yielder {
+                                switch: Cell::new(Some(parent)),
+                            };
                             let res = catch_unwind(AssertUnwindSafe(|| f(&yielder, input)));
-                            (yielder.switch.take().unwrap(), )
-                        },
-                        InputArg::Unwind { parent } => {},
+                            (yielder.switch.take().unwrap(),)
+                        }
+                        InputArg::Unwind { parent } => {}
                     }
                     todo!()
                 },
@@ -373,7 +375,7 @@ impl<Input, Yield, Return, Stack: stack::Stack> Coroutine<Input, Yield, Return, 
     /// This allows the stack to be re-used for another coroutine.
     #[allow(unused_mut)]
     pub fn into_stack(mut self) -> Stack {
-        match self.inner {
+        match self.inner.take().unwrap() {
             CoroutineImpl::Running(_) => {
                 panic!("cannot extract stack from an incomplete coroutine")
             }
@@ -434,7 +436,20 @@ impl<Input, Yield, Return, Stack> Yielder<Input, Yield, Return, Stack> {
     /// [`Coroutine::resume`] function is called again.
     pub fn suspend(&self, val: Yield) -> Input {
         // Does not allocate since the closure is ZST
-        self.switch.take().unwrap().(val)
+        let a: InputArg<Input, Yield, Return, Stack> =
+            self.switch
+                .take()
+                .unwrap()
+                .switch(|parent| OutputArg::Yield {
+                    coroutine_exec: parent,
+                    yield_: val,
+                    _input: PhantomData,
+                    _stack: PhantomData,
+                });
+        match a {
+            InputArg::Continue { input, parent } => todo!(),
+            InputArg::Unwind { parent } => std::panic::resume_unwind(Box::new(parent)),
+        }
     }
 
     /// Executes some code on the stack of the parent context (the one who
