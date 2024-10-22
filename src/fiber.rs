@@ -1,3 +1,5 @@
+pub mod future;
+
 use core::{convert::Infallible, ffi, marker::PhantomData, mem};
 
 use crate::{

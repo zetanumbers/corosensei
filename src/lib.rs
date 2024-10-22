@@ -249,6 +249,7 @@ pub mod trap;
 mod util;
 
 pub use coroutine::*;
+pub use fiber::future::FiberAwait;
 pub use fiber::*;
 
 #[cfg(test)]
