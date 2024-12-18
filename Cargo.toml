@@ -1,5 +1,5 @@
 [package]
-name = "corosensei"
+name = "rustc-corosensei"
 version = "0.2.1"
 authors = ["Amanieu d'Antras <amanieu@gmail.com>"]
 description = "A fast and safe implementation of stackful coroutines"
@@ -11,6 +11,9 @@ categories = ["data-structures", "no-std", "concurrency"]
 exclude = [".github", "ci"]
 edition = "2021"
 rust-version = "1.59.0"
+
+[lib]
+name = "corosensei"
 
 [dependencies]
 cfg-if = "1.0.0"
