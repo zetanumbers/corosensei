@@ -88,6 +88,9 @@ where
             panic!("fiber panicked, aborting...");
         });
 
+        // corosensei's stack limit includes the guard page while stacker don't, but it should be fine
+        stacker::set_stack_limit(Some(stack.limit().get()));
+
         let (execution, arg): (Fiber<_>, _) = execution.switch(core::convert::identity);
         execution.switch(|_| after_exit(arg, stack))
     })
@@ -104,6 +107,8 @@ where
 /// The `stack_base` must be the stack's base pointer, which you can get from `Stack::base`.
 /// Used stack can be deallocated or reused only if you ensure fiber's stack variables aren't
 /// referenced from somewhere else.
+///
+/// This function does not interact with the `stacker` library to ensure `stacker`'s correctness.
 pub unsafe fn fiber_unchecked(stack_base: StackPointer) -> Fiber<Infallible> {
     let sp = unsafe { arch::fiber_init_stack(stack_base) };
     Fiber::<Infallible> {
@@ -154,6 +159,7 @@ impl<Arg> Fiber<Arg> {
             function: intermediate,
         });
         unsafe {
+            let stack_limit = stacker::get_stack_limit();
             let arg = encode_val(&mut payload);
             arch::fiber_switch(
                 sp,
@@ -161,7 +167,9 @@ impl<Arg> Fiber<Arg> {
                 output.as_mut_ptr().cast::<ffi::c_void>(),
                 switcheroo::<Arg, YieldBack, F>,
             );
-            output.assume_init()
+            let output = output.assume_init();
+            stacker::set_stack_limit(stack_limit);
+            output
         }
     }
 
