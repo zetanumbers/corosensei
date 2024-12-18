@@ -89,7 +89,9 @@ where
         });
 
         // corosensei's stack limit includes the guard page while stacker don't, but it should be fine
-        stacker::set_stack_limit(Some(stack.limit().get()));
+        unsafe {
+            stacker::set_stack_limit(Some(stack.limit().get()));
+        }
 
         let (execution, arg): (Fiber<_>, _) = execution.switch(core::convert::identity);
         execution.switch(|_| after_exit(arg, stack))
@@ -158,8 +160,8 @@ impl<Arg> Fiber<Arg> {
         let mut payload = mem::ManuallyDrop::new(SwitchPayload {
             function: intermediate,
         });
+        let stack_limit = stacker::get_stack_limit();
         unsafe {
-            let stack_limit = stacker::get_stack_limit();
             let arg = encode_val(&mut payload);
             arch::fiber_switch(
                 sp,
