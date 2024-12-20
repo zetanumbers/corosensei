@@ -315,6 +315,7 @@ pub unsafe fn fiber_switch(
     mut f: SwitchFiberFunc,
 ) {
     let mut sp = stack_ptr.get();
+    let stack_limit = stacker::get_stack_limit();
     // TODO: edit the comment below
     // The function `fiber_switch` upon its call saves `ret: rdx` output pointer argument and
     // callee-saved registers (defined by to the AMD64 System-V ABI) to the stack.  So it switches
@@ -336,6 +337,7 @@ pub unsafe fn fiber_switch(
         lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
         clobber_abi("sysv64"),
     );
+    stacker::set_stack_limit(stack_limit);
     f(StackPointer::new_unchecked(sp), arg, ret)
 }
 

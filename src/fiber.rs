@@ -160,7 +160,6 @@ impl<Arg> Fiber<Arg> {
         let mut payload = mem::ManuallyDrop::new(SwitchPayload {
             function: intermediate,
         });
-        let stack_limit = stacker::get_stack_limit();
         unsafe {
             let arg = encode_val(&mut payload);
             arch::fiber_switch(
@@ -169,9 +168,7 @@ impl<Arg> Fiber<Arg> {
                 output.as_mut_ptr().cast::<ffi::c_void>(),
                 switcheroo::<Arg, YieldBack, F>,
             );
-            let output = output.assume_init();
-            stacker::set_stack_limit(stack_limit);
-            output
+            output.assume_init()
         }
     }
 
