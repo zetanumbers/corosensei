@@ -274,10 +274,16 @@ impl<Input, Yield, Return, Stack: stack::Stack> Coroutine<Input, Yield, Return, 
         // switch_and_link unwinds.
         self.stack_ptr = None;
 
+        let stack_limit = stacker::get_stack_limit();
+        // corosensei's stack limit includes the guard page while stacker don't, but it should be fine
+        stacker::set_stack_limit(Some(self.stack.limit().get()));
+
         let mut input = ManuallyDrop::new(input);
         let (result, stack_ptr) =
             arch::switch_and_link(util::encode_val(&mut input), stack_ptr, self.stack.base());
         self.stack_ptr = stack_ptr;
+
+        stacker::set_stack_limit(stack_limit);
 
         // Decode the returned value depending on whether the coroutine
         // terminated.
@@ -406,9 +412,15 @@ impl<Input, Yield, Return, Stack: stack::Stack> Coroutine<Input, Yield, Return, 
         // switch_and_throw unwinds.
         self.stack_ptr = None;
 
+        let stack_limit = stacker::get_stack_limit();
+        // corosensei's stack limit includes the guard page while stacker don't, but it should be fine
+        stacker::set_stack_limit(Some(self.stack.limit().get()));
+
         let (result, stack_ptr) =
             arch::switch_and_throw(forced_unwind, stack_ptr, self.stack.base());
         self.stack_ptr = stack_ptr;
+
+        stacker::set_stack_limit(stack_limit);
 
         // Decode the returned value depending on whether the coroutine
         // terminated.
